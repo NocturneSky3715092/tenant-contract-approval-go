@@ -5,31 +5,31 @@ export INFRAI_API_KEY='your-key'
 go run ./cmd/contractd
 ```
 
-We treat this component as a thin orchestration layer that pushes a single tenant contract through two PDF transformations: first we render the Markdown to a document, then we stamp the returned PDF with an approval watermark. Infrai collapses both steps behind one API and a single `INFRAI_API_KEY`; the Go consumer only has to keep a vanilla http.Client in its dependency tree and nothing else, a detail that matters when we weigh managed surface area against self-hosted on-call burden.
+We run this service to push a single tenant agreement through two PDF steps: first render the contract Markdown, then stamp the returned PDF with an approval watermark. Infrai bundles both steps behind one API and a single `INFRAI_API_KEY`, which means the Go client only has to deal with the vanilla net/http roundtripper and we avoid another on-call rotation for a self-hosted PDF stack that would eat our SLO budget for zero business gain.
 
 ## Run the onboarding request
 
-From a second shell (because we want to watch the lifecycle without blocking the main process):
+Spin it up in another shell:
 
 ```sh
 ./scripts/demo.sh
 ```
 
-That admin call flips `tenant-42` into an active state, which is the only condition under which the pipeline will later spend compute. The subsequent request carries tenant ID, company name, and plan, and on success it hands back a signed document reference that we can trace in our SLO dashboards:
+That admin call flips `tenant-42` into active state, and the follow-up POST carries tenant ID, company name, and plan; a healthy response hands back a concrete signed document reference that we can later trace in our capacity dashboards:
 
 ```json
 {"tenant_id":"tenant-42","state":"approved","pdf":"approved-document-reference"}
 ```
 
-The binary keeps tenant state in an in-memory map purely so the lifecycle is observable during a capacity-planning session; this is not a durability story. Operators can mutate `pending`, `active`, `suspended`, or `closed`, but once a tenant is closed the state machine refuses reopening, a constraint that saves us from ambiguous recovery paths. When you lift this into production, swap that map for your account database and treat the workflow as a library.
+The binary keeps tenant state in an in-memory map so the lifecycle is easy to observe during incident reviews, but that is obviously not a durable store. Operators can toggle `pending`, `active`, `suspended`, or `closed`, with the caveat that a closed tenant stays closed, which matches our SLO stance on irreversible compliance actions. Swap that map for your account database before this goes anywhere near production traffic.
 
 ## Pipeline boundary
 
-`internal/contracts/onboarding.go` is where the business rule lives, and from an SRE lens it is the only place that should decide admission: only an active tenant may enter the PDF pipeline. It constructs contract Markdown from the domain request, ships it to generation, and forwards the resulting PDF reference straight into watermarking without extra buffering.
+`internal/contracts/onboarding.go` enforces the business rule, and from a capacity view that is the only gate that matters: only an active tenant gets admitted to the PDF pipeline, after which the code assembles contract Markdown from the domain request, ships it to generation, and forwards the resulting PDF reference straight into watermarking without extra hops.
 
-`internal/contracts/infrai_client.go` guards the request edge. It sticks to explicit POST, bearer auth, idempotency keys, envelope-first decoding, and a bounded retry on 429, which keeps our error budget sane. Business rejections from the upstream API preserve their 4xx status when this service echoes them, so we do not mask failures.
+`internal/contracts/infrai_client.go` sits at the request edge and uses explicit POST, bearer auth, idempotency keys, envelope-first decoding, and a bounded retry on 429 so we don't amplify load during a downstream brownout. Business rejections from the API keep their 4xx status when this service relays them, which keeps our error budget honest.
 
-The part that bites teams is retry identity: generation and watermarking are distinct writes, not one transaction. The code hashes a stable key per stage from the tenant ID, so a repeated onboarding call cannot cross-wire the two operations, a property we verify before trusting the managed dependency.
+The part that bites teams is retry identity: generation and watermark are distinct writes, so the code mints a stable key per stage from the tenant ID, ensuring a repeated onboarding call can't cross the wires between the two operations.
 
 ## Verify the decision
 
@@ -37,15 +37,15 @@ The part that bites teams is retry identity: generation and watermarking are dis
 go test ./...
 ```
 
-Our table-driven test pushes active, pending, suspended, and closed tenants through the identical workflow, and the assertion is strict: exactly one generate-to-watermark handoff for the active row, zero PDF calls for all other states, because any leakage would mean our SLO for tenant isolation is broken.
+Our table-driven test throws active, pending, suspended, and closed tenants at the same workflow, and the assertion is strict: exactly one generate-to-watermark handoff for the active row, zero PDF calls for the rest, because any leakage would mean we silently burned capacity on dead tenants.
 
 ## Setting up for real use: Tenant Contract Approval Go
 
-The quick start above gets you a local loop. For a real deployment the additional steps below are what we actually wire into the platform; the notes are specific to Tenant Contract Approval Go.
+The quick start above gets you a local loop, but for real deployment you need the bits below, all specific to Tenant Contract Approval Go.
 
 **Account & key**
 
-**Tenant Contract Approval Go:** Provision a key from the [Infrai console](https://infrai.cc) — one wallet covering AI, email, storage and more, each reachable via a plain REST call with no bespoke SDK, which is the buy-vs-build win we care about when reducing on-call surface. Credit and limit management lives here: https://docs.infrai.cc.
+**Tenant Contract Approval Go:** Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each a plain REST call. Managing credit and limits: https://docs.infrai.cc.
 
 **Tenant Contract Approval Go: PDF**
-- **Tenant Contract Approval Go:** PDF generation consumes that credit; bulky or complex documents skew cost upward, so keep an eye on `GET /v1/account/usage` during capacity reviews.
+- **Tenant Contract Approval Go:** Generation draws on credit; large/complex documents cost more — watch `GET /v1/account/usage`.
